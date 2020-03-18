@@ -156,7 +156,11 @@
 //!
 //!         Ok((stream_id, quiche::h3::Event::Finished)) => {
 //!             // Peer terminated stream, handle it.
-//!         }
+//!         },
+//!
+//!         Ok((stream_id, quiche::h3::Event::GoAway(_id))) => {
+//!              // Peer signalled it is going away, handle it.
+//!         },
 //!
 //!         Err(quiche::h3::Error::Done) => {
 //!             // Done reading.
@@ -201,7 +205,11 @@
 //!
 //!         Ok((stream_id, quiche::h3::Event::Finished)) => {
 //!             // Peer terminated stream, handle it.
-//!         }
+//!         },
+//!
+//!         Ok((stream_id, quiche::h3::Event::GoAway(_id))) => {
+//!              // Peer signalled it is going away, handle it.
+//!         },
 //!
 //!         Err(quiche::h3::Error::Done) => {
 //!             // Done reading.
@@ -471,6 +479,9 @@ pub enum Event {
 
     /// Stream was closed,
     Finished,
+
+    /// GOAWAY was received.
+    GoAway(u64),
 }
 
 struct ConnectionSettings {
@@ -510,6 +521,9 @@ pub struct Connection {
     finished_streams: VecDeque<u64>,
 
     frames_greased: bool,
+
+    local_goaway_id: Option<u64>,
+    peer_goaway_id: Option<u64>,
 }
 
 impl Connection {
@@ -558,6 +572,9 @@ impl Connection {
             finished_streams: VecDeque::new(),
 
             frames_greased: false,
+
+            local_goaway_id: None,
+            peer_goaway_id: None,
         })
     }
 
@@ -602,6 +619,12 @@ impl Connection {
     pub fn send_request(
         &mut self, conn: &mut super::Connection, headers: &[Header], fin: bool,
     ) -> Result<u64> {
+        // If we received a GOAWAY from the peer, MUST NOT initiate new
+        // requests.
+        if self.peer_goaway_id.is_some() {
+            return Err(Error::FrameUnexpected);
+        }
+
         let stream_id = self.next_request_stream_id;
 
         self.streams
@@ -835,15 +858,33 @@ impl Connection {
 
         // Process control streams first.
         if let Some(stream_id) = self.peer_control_stream_id {
-            self.process_control_stream(conn, stream_id)?;
+            match self.process_control_stream(conn, stream_id) {
+                Ok(ev) => return Ok(ev),
+
+                Err(Error::Done) => (),
+
+                Err(e) => return Err(e),
+            };
         }
 
         if let Some(stream_id) = self.peer_qpack_streams.encoder_stream_id {
-            self.process_control_stream(conn, stream_id)?;
+            match self.process_control_stream(conn, stream_id) {
+                Ok(ev) => return Ok(ev),
+
+                Err(Error::Done) => (),
+
+                Err(e) => return Err(e),
+            };
         }
 
         if let Some(stream_id) = self.peer_qpack_streams.decoder_stream_id {
-            self.process_control_stream(conn, stream_id)?;
+            match self.process_control_stream(conn, stream_id) {
+                Ok(ev) => return Ok(ev),
+
+                Err(Error::Done) => (),
+
+                Err(e) => return Err(e),
+            };
         }
 
         // Process finished streams list.
@@ -875,6 +916,54 @@ impl Connection {
         }
 
         Err(Error::Done)
+    }
+
+    /// Sends a GOAWAY frame to support graceful connection closure.
+    ///
+    /// When quiche is used in the server role, the `id` parameter is the stream
+    /// ID of the highest processed request. This can be any valid ID between 0
+    /// and 2^62-4. However, the ID cannot be increased. Failure to satisfy
+    /// these conditions will return an error.
+    ///
+    /// This method does not close the QUIC connection. Applications are
+    /// required to call [`close`] themselves.
+    ///
+    /// [`close()`]: ../struct.Connection.html#method.close
+    pub fn send_goaway(
+        &mut self, conn: &mut super::Connection, id: u64,
+    ) -> Result<()> {
+        if self.is_server && id % 4 != 0 {
+            return Err(Error::IdError);
+        }
+
+        if let Some(sent_id) = self.local_goaway_id {
+            if id > sent_id {
+                return Err(Error::IdError);
+            }
+        }
+
+        if let Some(stream_id) = self.control_stream_id {
+            let mut d = [42; 10];
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+
+            let frame = frame::Frame::GoAway { id };
+
+            let wire_len = frame.to_bytes(&mut b)?;
+            let stream_cap = conn.stream_capacity(stream_id)?;
+
+            if stream_cap < wire_len {
+                return Err(Error::StreamBlocked);
+            }
+
+            trace!("{} tx frm {:?}", conn.trace_id(), frame);
+
+            let off = b.off();
+            conn.stream_send(stream_id, &d[..off], false)?;
+
+            self.local_goaway_id = Some(id);
+        }
+
+        Ok(())
     }
 
     fn open_uni_stream(
@@ -1021,7 +1110,7 @@ impl Connection {
 
     fn process_control_stream(
         &mut self, conn: &mut super::Connection, stream_id: u64,
-    ) -> Result<()> {
+    ) -> Result<(u64, Event)> {
         if conn.stream_finished(stream_id) {
             conn.close(
                 true,
@@ -1033,7 +1122,7 @@ impl Connection {
         }
 
         match self.process_readable_stream(conn, stream_id) {
-            Ok(_) => (),
+            Ok(ev) => return Ok(ev),
 
             Err(Error::Done) => (),
 
@@ -1050,7 +1139,7 @@ impl Connection {
             return Err(Error::ClosedCriticalStream);
         }
 
-        Ok(())
+        Err(Error::Done)
     }
 
     fn process_readable_stream(
@@ -1353,19 +1442,7 @@ impl Connection {
                 // Do nothing. The Data event is returned separately.
             },
 
-            frame::Frame::GoAway {
-                stream_id: goaway_stream_id,
-            } => {
-                if self.is_server {
-                    conn.close(
-                        true,
-                        Error::FrameUnexpected.to_wire(),
-                        b"GOWAY received on server",
-                    )?;
-
-                    return Err(Error::FrameUnexpected);
-                }
-
+            frame::Frame::GoAway { id } => {
                 if Some(stream_id) != self.peer_control_stream_id {
                     conn.close(
                         true,
@@ -1376,17 +1453,31 @@ impl Connection {
                     return Err(Error::FrameUnexpected);
                 }
 
-                if goaway_stream_id % 4 != 0 {
+                if !self.is_server && id % 4 != 0 {
                     conn.close(
                         true,
                         Error::FrameUnexpected.to_wire(),
                         b"GOAWAY received with ID of non-request stream",
                     )?;
 
-                    return Err(Error::FrameUnexpected);
+                    return Err(Error::IdError);
                 }
 
-                // TODO: implement GOAWAY
+                if let Some(received_id) = self.peer_goaway_id {
+                    if id > received_id {
+                        conn.close(
+                            true,
+                            Error::IdError.to_wire(),
+                            b"GOAWAY received with ID larger than previously received",
+                        )?;
+
+                        return Err(Error::IdError);
+                    }
+                }
+
+                self.peer_goaway_id = Some(id);
+
+                return Ok((stream_id, Event::GoAway(id)));
             },
 
             frame::Frame::MaxPushId { push_id } => {
@@ -2299,21 +2390,19 @@ mod tests {
     }
 
     #[test]
-    /// Send a GOAWAY frame from the client, which is forbidden.
-    fn goaway_from_client() {
+    /// Send a GOAWAY frame from the client
+    fn goaway_from_client_good() {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
 
-        s.send_frame_client(
-            frame::Frame::GoAway { stream_id: 100 },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client.send_goaway(&mut s.pipe.client, 1).unwrap();
 
         s.advance().ok();
 
-        assert_eq!(s.poll_server(), Err(Error::FrameUnexpected));
+        assert_eq!(
+            s.poll_server(),
+            Ok((s.client.control_stream_id.unwrap(), Event::GoAway(1)))
+        );
     }
 
     #[test]
@@ -2322,31 +2411,77 @@ mod tests {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
 
-        s.send_frame_server(
-            frame::Frame::GoAway { stream_id: 100 },
-            s.server.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.server.send_goaway(&mut s.pipe.server, 4000).unwrap();
 
-        assert_eq!(s.poll_client(), Err(Error::Done));
+        s.advance().ok();
+
+        assert_eq!(
+            s.poll_client(),
+            Ok((s.server.control_stream_id.unwrap(), Event::GoAway(4000)))
+        );
     }
 
     #[test]
-    /// Send a GOAWAY frame from the server, that references a request that does
-    /// not exist.
-    fn goaway_from_server_bad_id() {
+    /// A client MUST NOT send a request after it receives GOAWAY
+    fn client_request_after_goaway() {
+        let mut s = Session::default().unwrap();
+        s.handshake().unwrap();
+
+        s.server.send_goaway(&mut s.pipe.server, 4000).unwrap();
+
+        s.advance().ok();
+
+        assert_eq!(
+            s.poll_client(),
+            Ok((s.server.control_stream_id.unwrap(), Event::GoAway(4000)))
+        );
+
+        assert_eq!(s.send_request(true), Err(Error::FrameUnexpected));
+    }
+
+    #[test]
+    /// Send a GOAWAY frame from the server, using an invalid goaway ID
+    fn goaway_from_server_invalid_id() {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_server(
-            frame::Frame::GoAway { stream_id: 1 },
+            frame::Frame::GoAway { id: 1 },
             s.server.control_stream_id.unwrap(),
             false,
         )
         .unwrap();
 
-        assert_eq!(s.poll_client(), Err(Error::FrameUnexpected));
+        assert_eq!(s.poll_client(), Err(Error::IdError));
+    }
+
+    #[test]
+    /// Send a multiple GOAWAY frames from the server, that increase the goaway
+    /// ID
+    fn goaway_from_server_increase_id() {
+        let mut s = Session::default().unwrap();
+        s.handshake().unwrap();
+
+        s.send_frame_server(
+            frame::Frame::GoAway { id: 0 },
+            s.server.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        s.send_frame_server(
+            frame::Frame::GoAway { id: 4 },
+            s.server.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            s.poll_client(),
+            Ok((s.server.control_stream_id.unwrap(), Event::GoAway(0)))
+        );
+
+        assert_eq!(s.poll_client(), Err(Error::IdError));
     }
 
     #[test]

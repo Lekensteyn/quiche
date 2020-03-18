@@ -258,6 +258,10 @@ fn main() {
                         conn.close(true, 0x00, b"kthxbye").unwrap();
                     },
 
+                    Ok((_stream_id, quiche::h3::Event::GoAway(_id))) => {
+                        info!("GOAWAY!");
+                    },
+
                     Err(quiche::h3::Error::Done) => {
                         break;
                     },
