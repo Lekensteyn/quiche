@@ -43,7 +43,7 @@ use crate::packet;
 use crate::ranges;
 
 // Loss Recovery
-const PACKET_THRESHOLD: u64 = 3;
+pub const PACKET_THRESHOLD: u64 = 3;
 
 const TIME_THRESHOLD: f64 = 9.0 / 8.0;
 

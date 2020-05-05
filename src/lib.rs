@@ -1347,8 +1347,16 @@ impl Connection {
 
         let mut b = octets::OctetsMut::with_slice(buf);
 
-        let mut hdr = Header::from_bytes(&mut b, self.scid.len())
-            .map_err(|e| drop_pkt_on_err(e, self.recv_count, &self.trace_id))?;
+        let mut hdr =
+            Header::from_bytes(&mut b, self.scid.len()).map_err(|e| {
+                drop_pkt_on_err(
+                    e,
+                    self.recv_count,
+                    self.sent_count,
+                    self.is_server,
+                    &self.trace_id,
+                )
+            })?;
 
         if hdr.ty == packet::Type::VersionNegotiation {
             // Version negotiation packets can only be sent by the server.
@@ -1549,6 +1557,8 @@ impl Connection {
                     return Err(drop_pkt_on_err(
                         Error::CryptoFail,
                         self.recv_count,
+                        self.sent_count,
+                        self.is_server,
                         &self.trace_id,
                     )),
             }
@@ -1556,8 +1566,15 @@ impl Connection {
 
         let aead_tag_len = aead.alg().tag_len();
 
-        packet::decrypt_hdr(&mut b, &mut hdr, &aead)
-            .map_err(|e| drop_pkt_on_err(e, self.recv_count, &self.trace_id))?;
+        packet::decrypt_hdr(&mut b, &mut hdr, &aead).map_err(|e| {
+            drop_pkt_on_err(
+                e,
+                self.recv_count,
+                self.sent_count,
+                self.is_server,
+                &self.trace_id,
+            )
+        })?;
 
         let pn = packet::decode_pkt_num(
             self.pkt_num_spaces[epoch].largest_rx_pkt_num,
@@ -1601,7 +1618,15 @@ impl Connection {
 
         let mut payload =
             packet::decrypt_pkt(&mut b, pn, pn_len, payload_len, &aead).map_err(
-                |e| drop_pkt_on_err(e, self.recv_count, &self.trace_id),
+                |e| {
+                    drop_pkt_on_err(
+                        e,
+                        self.recv_count,
+                        self.sent_count,
+                        self.is_server,
+                        &self.trace_id,
+                    )
+                },
             )?;
 
         if self.pkt_num_spaces[epoch].recv_pkt_num.contains(pn) {
@@ -3427,14 +3452,37 @@ impl Connection {
 /// This must only be used for errors preceding packet authentication. Failures
 /// happening after a packet has been authenticated should still cause the
 /// connection to be aborted.
-fn drop_pkt_on_err(e: Error, recv_count: usize, trace_id: &str) -> Error {
-    // If no other packet has been successflully processed, abort the connection
-    // to avoid keeping the connection open when only junk is received.
-    if recv_count == 0 {
+fn drop_pkt_on_err(
+    e: Error, recv_count: usize, sent_count: usize, is_server: bool,
+    trace_id: &str,
+) -> Error {
+    // Server: If no other packet has been successflully processed, abort the
+    // connection to avoid keeping the connection open when only junk is received.
+    if is_server && recv_count == 0 {
         return e;
     }
 
-    trace!("{} dropped invalid packet", trace_id);
+    // Client: If no other packet has been successfully processed even after
+    // sending a few Initial packets, abort the connection to avoid keeping the
+    // connection open when only junk is received.
+    //
+    // It's allowed to try to send a few packets before returning failure to allow
+    // incoming Initial packet loss or reordering. PACKET_THRESHOLD is used here
+    // for the packet count threshold. Only the crypto failure is allowed within
+    // the threshold.
+    if !is_server &&
+        (sent_count > recovery::PACKET_THRESHOLD as usize ||
+            e != Error::CryptoFail)
+    {
+        return e;
+    }
+
+    trace!(
+        "{} dropped invalid packet recv={} sent={}",
+        trace_id,
+        recv_count,
+        sent_count
+    );
 
     // Ignore other invalid packets that haven't been authenticated to prevent
     // man-in-the-middle and man-on-the-side attacks.
@@ -5256,7 +5304,7 @@ mod tests {
     #[test]
     /// Tests that invalid packets received before any other valid ones cause
     /// the server to close the connection immediately.
-    fn invalid_initial() {
+    fn invalid_initial_server() {
         let mut buf = [0; 65535];
         let mut pipe = testing::Pipe::default().unwrap();
 
@@ -5283,6 +5331,63 @@ mod tests {
         );
 
         assert!(pipe.server.is_closed());
+    }
+
+    #[test]
+    /// Tests that invalid Initial packets received to cause
+    /// the client to close the connection immediately.
+    fn invalid_initial_client() {
+        let mut buf = [0; 65535];
+        let mut pipe = testing::Pipe::default().unwrap();
+
+        // Client sends initial flight.
+        let len = pipe.client.send(&mut buf).unwrap();
+
+        // Server sends initial flight.
+        assert_eq!(pipe.server.recv(&mut buf[..len]), Ok(1200));
+
+        let frames = [frame::Frame::Padding { len: 10 }];
+
+        let written = testing::encode_pkt(
+            &mut pipe.server,
+            packet::Type::Initial,
+            &frames,
+            &mut buf,
+        )
+        .unwrap();
+
+        // Corrupt the packets's last byte to make decryption fail (the last
+        // byte is part of the AEAD tag, so changing it means that the packet
+        // cannot be authenticated during decryption).
+        buf[written - 1] = !buf[written - 1];
+
+        // Client waits Initial packet but corrupted.
+        // It will be discarded `recovery::PACKET_THRESHOLD` times.
+        for i in 0..(recovery::PACKET_THRESHOLD + 1) {
+            if i < recovery::PACKET_THRESHOLD {
+                // Packet received and discarded.
+                assert_eq!(pipe.client.recv(&mut buf[..written]), Ok(68));
+            } else {
+                // Last one should fail with `Error::CryptoFail`.
+                assert_eq!(
+                    pipe.client.recv(&mut buf[..written]),
+                    Err(Error::CryptoFail)
+                );
+                break;
+            }
+
+            // Invoke loss timer for retransmitting Initial.
+            let now = pipe.client.recovery.loss_detection_timer().unwrap();
+            pipe.client
+                .recovery
+                .on_loss_detection_timeout(false, now, "");
+
+            let mut sbuf = [0; 65535];
+            pipe.client.send(&mut sbuf).unwrap();
+        }
+
+        // Client should close the connection.
+        assert!(pipe.client.is_closed());
     }
 
     #[test]
